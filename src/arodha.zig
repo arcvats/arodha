@@ -5,8 +5,8 @@ pub const DEFAULT_INTERVAL = 1000;
 pub const DEFAULT_TIMEOUT = 60 * 1000;
 pub const DEFAULT_CONSECUTIVE_FAILURES = 5;
 
-fn readyToTrip(counters: Counters) bool {
-    return counters.consecutive_failures >= DEFAULT_CONSECUTIVE_FAILURES;
+fn readyToTrip(requestStates: RequestStates) bool {
+    return requestStates.consecutive_failures >= DEFAULT_CONSECUTIVE_FAILURES;
 }
 
 fn isSuccessful(err: CircuitBreakerError) bool {
@@ -30,31 +30,33 @@ pub const CircuitBreakerError = error{
 // interval: The time interval after which the circuit breaker will check if it is ready to trip
 // timeout: The time interval after which a request is considered failed
 // metadata: Additional metadata that can be used to configure the circuit breaker
+// errors: The list of errors that are considered failures
 pub const Config = struct {
     max_requests: u32,
-    interval: std.time.Milliseconds,
-    timeout: std.time.Milliseconds,
+    interval: i64,
+    timeout: i64,
     metadata: std.StringHashMap,
-    readyToTrip: fn (Counters) bool,
+    errors: []error{},
+    readyToTrip: fn (RequestStates) bool,
     onStateChange: fn (State, State) void,
     isSuccessful: fn (CircuitBreakerError) bool,
 };
 
-// Counters to keep track of the number of requests, successes, and failures
+// RequestStates to keep track of the number of requests, successes, and failures
 // requests: The total number of requests made
 // total_successes: The total number of successful requests made
 // total_failures: The total number of failed requests made
 // consecutive_successes: The number of consecutive successful requests made
 // consecutive_failures: The number of consecutive failed requests made
-pub const Counters = struct {
+pub const RequestStates = struct {
     requests: u32,
     total_successes: u32,
     total_failures: u32,
     consecutive_successes: u32,
     consecutive_failures: u32,
 
-    pub fn init() Counters {
-        return Counters{
+    pub fn init() RequestStates {
+        return RequestStates{
             .requests = 0,
             .total_successes = 0,
             .total_failures = 0,
@@ -63,23 +65,23 @@ pub const Counters = struct {
         };
     }
 
-    pub fn onRequest(self: Counters) void {
+    pub fn onRequest(self: *RequestStates) void {
         self.requests += 1;
     }
 
-    pub fn onSuccess(self: Counters) void {
+    pub fn onSuccess(self: *RequestStates) void {
         self.total_successes += 1;
         self.consecutive_successes += 1;
         self.consecutive_failures = 0;
     }
 
-    pub fn onFailure(self: Counters) void {
+    pub fn onFailure(self: *RequestStates) void {
         self.total_failures += 1;
         self.consecutive_failures += 1;
         self.consecutive_successes = 0;
     }
 
-    pub fn reset(self: Counters) void {
+    pub fn reset(self: *RequestStates) void {
         self.requests = 0;
         self.total_successes = 0;
         self.total_failures = 0;
@@ -91,7 +93,7 @@ pub const Counters = struct {
 pub const CircuitBreaker = struct {
     state: State,
     expiry: i64,
-    counters: Counters,
+    requestStates: RequestStates,
     config: Config,
     mutex: std.Thread.Mutex,
 
@@ -110,13 +112,13 @@ pub const CircuitBreaker = struct {
         return CircuitBreaker{
             .state = State.CLOSED,
             .expiry = 0, // FIXME: std.time.milliTimestamp() + config.interval,
-            .counters = Counters.init(),
+            .requestStates = RequestStates.init(),
             .config = config,
             .mutex = std.Mutex.init,
         };
     }
 
-    fn setState(self: CircuitBreaker, state: State, now: i64) void {
+    fn setState(self: CircuitBreaker, state: State, _: i64) void {
         if (self.state == state) {
             return;
         }
@@ -138,7 +140,7 @@ pub const CircuitBreaker = struct {
                 }
             },
             State.HALF_OPEN => {
-                if (self.config.readyToTrip(self.counters)) {
+                if (self.config.readyToTrip(self.requestStates)) {
                     return State.OPEN;
                 }
             },
@@ -147,7 +149,44 @@ pub const CircuitBreaker = struct {
         return self.state;
     }
 
+    fn beforeRequest(self: CircuitBreaker) CircuitBreakerError {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const state = self.currentState(std.time.milliTimestamp());
+
+        if (state == State.OPEN) {
+            return CircuitBreakerError.OpenCircuit;
+        } else if (state == State.HALF_OPEN and self.requestStates.requests >= self.config.max_requests) {
+            return CircuitBreakerError.TooManyRequests;
+        }
+
+        self.requestStates.onRequest();
+        return null;
+    }
+
+    fn afterRequest(self: CircuitBreaker, _: i64, success: bool) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const state = self.currentState(std.time.milliTimestamp());
+
+        if (success) {
+            self.onSuccess(state);
+        } else {
+            self.onFailure(state);
+        }
+    }
+
     pub fn getCurrentState(self: CircuitBreaker) State {
-        return self.state;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.currentState(std.time.milliTimestamp());
+    }
+
+    pub fn getRequestStates(self: CircuitBreaker) RequestStates {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.requestStates;
     }
 };
