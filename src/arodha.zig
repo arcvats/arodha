@@ -118,7 +118,7 @@ pub const CircuitBreaker = struct {
         };
     }
 
-    fn setState(self: CircuitBreaker, state: State, _: i64) void {
+    fn setState(self: CircuitBreaker, state: State) void {
         if (self.state == state) {
             return;
         }
@@ -131,29 +131,58 @@ pub const CircuitBreaker = struct {
         }
     }
 
-    fn currentState(self: CircuitBreaker, now: i64) State {
-        // std.time.milliTimestamp()
-        switch (self.state) {
-            State.OPEN => {
-                if (now >= self.expiry) {
-                    return State.HALF_OPEN;
+    // fn currentState(self: CircuitBreaker) State {
+    //     switch (self.state) {
+    //         State.OPEN => {
+    //             if (self.expiry != 0 and std.time.milliTimestamp() >= self.expiry) {
+    //                 return State.HALF_OPEN;
+    //             }
+    //         },
+    //         State.HALF_OPEN => {
+    //             if (self.config.readyToTrip(self.requestStates)) {
+    //                 return State.OPEN;
+    //             }
+    //         },
+    //         else => {},
+    //     }
+    //     return self.state;
+    // }
+
+    fn onSuccess(self: CircuitBreaker, state: State) void {
+        switch (state) {
+            State.HALF_OPEN => {
+                self.requestStates.onSuccess();
+                if (self.requestStates.consecutive_successes >= self.config.max_requests) {
+                    self.setState(State.CLOSED);
                 }
             },
+            State.CLOSED => {
+                self.requestStates.onSuccess();
+            },
+            else => {},
+        }
+    }
+
+    fn onFailure(self: CircuitBreaker, state: State) void {
+        switch (state) {
             State.HALF_OPEN => {
+                self.setState(State.OPEN);
+            },
+            State.CLOSED => {
+                self.requestStates.onFailure();
                 if (self.config.readyToTrip(self.requestStates)) {
-                    return State.OPEN;
+                    self.setState(State.OPEN);
                 }
             },
             else => {},
         }
-        return self.state;
     }
 
     fn beforeRequest(self: CircuitBreaker) CircuitBreakerError {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const state = self.currentState(std.time.milliTimestamp());
+        const state = self.currentState();
 
         if (state == State.OPEN) {
             return CircuitBreakerError.OpenCircuit;
@@ -165,11 +194,11 @@ pub const CircuitBreaker = struct {
         return null;
     }
 
-    fn afterRequest(self: CircuitBreaker, _: i64, success: bool) void {
+    fn afterRequest(self: CircuitBreaker, success: bool) void {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const state = self.currentState(std.time.milliTimestamp());
+        const state = self.currentState();
 
         if (success) {
             self.onSuccess(state);
@@ -181,7 +210,7 @@ pub const CircuitBreaker = struct {
     pub fn getCurrentState(self: CircuitBreaker) State {
         self.mutex.lock();
         defer self.mutex.unlock();
-        return self.currentState(std.time.milliTimestamp());
+        return self.currentState();
     }
 
     pub fn getRequestStates(self: CircuitBreaker) RequestStates {
